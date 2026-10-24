@@ -12,6 +12,7 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import org.bstats.bukkit.Metrics;
+import org.bukkit.Chunk;
 import org.bukkit.GameMode;
 import org.bukkit.Location;
 import org.bukkit.Material;
@@ -21,7 +22,14 @@ import org.bukkit.World;
 import org.bukkit.block.Block;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
+import org.bukkit.event.block.Action;
+import org.bukkit.event.block.BlockBreakEvent;
+import org.bukkit.event.block.BlockPlaceEvent;
+import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.event.world.ChunkLoadEvent;
+import org.bukkit.event.world.ChunkUnloadEvent;
 import org.bukkit.persistence.PersistentDataContainer;
 import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -90,52 +98,61 @@ public final class Plugin extends JavaPlugin implements Listener {
 
     private @Nullable ScheduledTask task;
 
+    private final @NotNull VaultIndex vaultIndex = new VaultIndex();
+
     private @Nullable NamespacedKey namespacedKey(final @NotNull String key) {
         return NamespacedKey.fromString(key, this);
+    }
+
+    private static boolean isFolia() {
+        try {
+            Class.forName("io.papermc.paper.threadedregions.RegionizedServer");
+            return true;
+        }
+        catch (final ClassNotFoundException e) {
+            return false;
+        }
+    }
+
+    private static VaultIndex.@NotNull Position position(final @NotNull Block block) {
+        return new VaultIndex.Position(block.getX(), block.getY(), block.getZ());
+    }
+
+    private void indexChunk(final @NotNull Chunk chunk) {
+        final List<VaultIndex.Position> vaults = new ArrayList<>();
+        for (final var state : chunk.getTileEntities(block -> block.getType() == Material.VAULT, false))
+            vaults.add(new VaultIndex.Position(state.getX(), state.getY(), state.getZ()));
+        vaultIndex.replaceChunk(chunk.getWorld().getUID(), chunk.getX(), chunk.getZ(), vaults);
     }
 
     private void checkVaultCooldownsNearPlayer(final @NotNull Player player) {
         final Location location;
         final World world;
-        final int blockX;
-        final int blockY;
-        final int blockZ;
-        final Map<Long, List<int[]>> blocksByChunk;
+        final Map<Long, List<VaultIndex.Position>> vaultsByChunk;
         if (!player.isConnected() || player.getGameMode() == GameMode.SPECTATOR)
             return;
         if ((location = player.getLocation()) == null)
             return;
         if ((world = location.getWorld()) == null)
             return;
-        blockX = location.getBlockX();
-        blockY = location.getBlockY();
-        blockZ = location.getBlockZ();
-        blocksByChunk = new HashMap<>();
-        for (int x = blockX - 3; x <= blockX + 3; x++) {
-            for (int y = blockY - 3; y <= blockY + 3; y++) {
-                for (int z = blockZ - 3; z <= blockZ + 3; z++) {
-                    final int chunkX = x >> 4;
-                    final int chunkZ = z >> 4;
-                    final long chunkKey = ((long)chunkX << 32) | (chunkZ & 0xFFFFFFFFL);
-                    blocksByChunk.computeIfAbsent(chunkKey, $ -> new ArrayList<>()).add(new int[] {x, y, z});
-                }
-            }
-        }
-        for (final var entry : blocksByChunk.entrySet()) {
+        vaultsByChunk = vaultIndex.near(world.getUID(), location.getBlockX(), location.getBlockY(), location.getBlockZ(), 3);
+        for (final var entry : vaultsByChunk.entrySet()) {
             final long chunkKey = entry.getKey();
             final int chunkX = (int)(chunkKey >> 32);
             final int chunkZ = (int)chunkKey;
-            final List<int[]> blocks = entry.getValue();
+            final List<VaultIndex.Position> vaults = entry.getValue();
             getServer().getRegionScheduler().execute(
                 this,
                 world,
                 chunkX,
                 chunkZ,
                 () -> {
-                    for (final var coords : blocks) {
-                        final Block block = world.getBlockAt(coords[0], coords[1], coords[2]);
+                    for (final var vault : vaults) {
+                        final Block block = world.getBlockAt(vault.x(), vault.y(), vault.z());
                         if (block.getType() == Material.VAULT)
                             checkVaultCooldowns(block);
+                        else
+                            vaultIndex.remove(world.getUID(), vault);
                     }
                 });
         }
@@ -297,6 +314,44 @@ public final class Plugin extends JavaPlugin implements Listener {
         }
     }
 
+    @EventHandler
+    public void onChunkLoad(final @NotNull ChunkLoadEvent event) {
+        indexChunk(event.getChunk());
+    }
+
+    @EventHandler
+    public void onChunkUnload(final @NotNull ChunkUnloadEvent event) {
+        final Chunk chunk = event.getChunk();
+        vaultIndex.removeChunk(chunk.getWorld().getUID(), chunk.getX(), chunk.getZ());
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onBlockPlace(final @NotNull BlockPlaceEvent event) {
+        final Block block = event.getBlockPlaced();
+        if (block.getType() == Material.VAULT)
+            vaultIndex.add(block.getWorld().getUID(), position(block));
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onBlockBreak(final @NotNull BlockBreakEvent event) {
+        final Block block = event.getBlock();
+        if (block.getType() == Material.VAULT)
+            vaultIndex.remove(block.getWorld().getUID(), position(block));
+    }
+
+    /** Runs before the vault handles the key, so a vault the index missed (pasted by a
+     *  world editor without a chunk reload) is picked up and its cooldowns cleared first. */
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void onPlayerInteract(final @NotNull PlayerInteractEvent event) {
+        final Block block;
+        if (event.getAction() != Action.RIGHT_CLICK_BLOCK)
+            return;
+        if ((block = event.getClickedBlock()) == null || block.getType() != Material.VAULT)
+            return;
+        vaultIndex.add(block.getWorld().getUID(), position(block));
+        checkVaultCooldowns(block);
+    }
+
     // MARK: JavaPlugin
 
     @Override
@@ -312,6 +367,14 @@ public final class Plugin extends JavaPlugin implements Listener {
         new Metrics(this, BSTATS_PLUGIN_ID);
         configuration = new Configuration(this);
         server.getPluginManager().registerEvents(this, this);
+        // Folia forbids reading other regions' chunks from here; its chunk load events fill
+        // the index instead. On Paper, chunks loaded before enable (spawn) are scanned now.
+        if (!isFolia()) {
+            for (final var world : server.getWorlds())
+                for (final var chunk : world.getLoadedChunks())
+                    indexChunk(chunk);
+            getLogger().info("Indexed " + vaultIndex.size() + " vaults in loaded chunks");
+        }
         task =
             server.getGlobalRegionScheduler().runAtFixedRate(
                 this,

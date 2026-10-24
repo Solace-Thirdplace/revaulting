@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "moe.minacle.minecraft"
-version = "0.4.0"
+version = "0.4.0-tp.1"
 
 repositories {
     mavenCentral()
@@ -18,6 +18,9 @@ repositories {
 dependencies {
     compileOnly("io.papermc.paper:paper-api:${libs.versions.minecraft.get()}-R0.1-SNAPSHOT")
     implementation(libs.bstats.bukkit)
+    testImplementation(platform("org.junit:junit-bom:5.11.4"))
+    testImplementation("org.junit.jupiter:junit-jupiter")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
 java {
@@ -27,6 +30,10 @@ java {
 }
 
 tasks {
+    test {
+        useJUnitPlatform()
+    }
+
     processResources {
         val props = mapOf("version" to project.version)
         inputs.properties(props)
